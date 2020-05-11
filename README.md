@@ -4,3 +4,7 @@
 [![LICENSE](https://img.shields.io/badge/license-Anti%20996-blue.svg?style=flat-square)](https://github.com/996icu/996.ICU/blob/master/LICENSE)
 
 A Pytorch implemtentation of ICCV 2019 paper [Face Swapping Gan](https://arxiv.org/abs/1908.05932). Only the reenactment part in the paper is included in this repo.
+
+## Requirements:
+A pretrained face recognition VGG19 model
+A suitable dataset for face swapping and its face segmentation masks
