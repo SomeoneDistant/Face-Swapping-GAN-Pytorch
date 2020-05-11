@@ -4,11 +4,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 import torchvision
 import math
 
+import mobifacenet
+import vgg
 
 Norm = nn.InstanceNorm2d
 # Norm = nn.BatchNorm2d
@@ -99,7 +101,7 @@ class Upsample(nn.Module):
 		self.relu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
 	def forward(self, x):
-		x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
+		x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear')
 		x = self.conv1(x)
 		x = self.bn1(x)
 		x = self.relu(x)
@@ -149,6 +151,13 @@ class Globalgenerator(nn.Module):
 
 		self.outputlayer = Outputlayer(out_planes=out_planes)
 
+		for m in self.modules():
+			if isinstance(m, nn.Conv2d):
+				nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+			elif isinstance(m, nn.BatchNorm2d):
+				nn.init.constant_(m.weight, 1)
+				nn.init.constant_(m.bias, 0)
+
 	def _make_layer(self, n, planes):
 		layers = []
 		for i in range(n):
@@ -180,10 +189,10 @@ class Globalgenerator(nn.Module):
 
 		x = self.outputlayer(x1)
 
-		return x
+		return x, x1
 
 class Enhancer(nn.Module):
-	def __init__(self, generator, n, scale_factor, in_planes, out_planes):
+	def __init__(self, generator, ckpt_path, n, scale_factor, in_planes, out_planes, fix=False):
 		super(Enhancer, self).__init__()
 		self.inputlayer = Inputlayer(in_planes=in_planes)
 		self.down = Downsample(128, 256)
@@ -199,8 +208,26 @@ class Enhancer(nn.Module):
 			nn.Sigmoid()
 			)
 
-		self.generator = generator
+		self.change_dim = nn.Sequential(
+			nn.Conv2d(128, 256, kernel_size=1),
+			Norm(256)
+			)
+		self.relu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+
 		self.scale_factor = scale_factor
+
+		for m in self.modules():
+			if isinstance(m, nn.Conv2d):
+				nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+			elif isinstance(m, nn.BatchNorm2d):
+				nn.init.constant_(m.weight, 1)
+				nn.init.constant_(m.bias, 0)
+
+		self.generator = generator
+		self.generator.load_state_dict(torch.load(ckpt_path))
+		if fix:
+			for param in self.generator.parameters():
+				param.requires_grad = False
 
 	def _make_layer(self, n, planes):
 		layers = []
@@ -214,10 +241,11 @@ class Enhancer(nn.Module):
 		x1 = self.inputlayer(x)
 		x1 = self.down(x1)
 
-		x2 = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
-		x2 = self.generator(x2)
+		x2 = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear')
+		outputs_lr, x2 = self.generator(x2)
 
-		feature = x1 + x2
+		feature = self.relu(x1 + self.change_dim(x2))
+
 		x = self.up1(feature)
 		x = self.bottleneck1(x)
 		outputs = self.outputlayer(x)
@@ -226,12 +254,12 @@ class Enhancer(nn.Module):
 		s = self.bottleneck2(s)
 		segment = self.seglayer(s)
 
-		return outputs, segment
+		return outputs, segment, outputs_lr
 
-def Reenactment(n=2, n1=2, n2=2, n3=3, n4=3):
-	generator = Globalgenerator(n1, n2, n3, n4, 71, 256)
-	reenactor = Enhancer(generator, n, 0.5, 71, 3)
-	return reenactor
+# def Reenactment(n=2, n1=2, n2=2, n3=3, n4=3):
+# 	generator = Globalgenerator(n1, n2, n3, n4, 71, 3)
+# 	reenactor = Enhancer(generator, n, 0.5, 71, 3)
+# 	return reenactor
 
 # Discriminator
 
@@ -336,17 +364,72 @@ class PerceptualModel(torch.nn.Module):
 		return h_relu1_2, h_relu2_2, h_relu3_4, h_relu4_4
 
 class Generator(nn.Module):
-	def __init__(self, model, FLoss=False, resume_path='', consistensy_iter=2):
+	def __init__(self, model, resume_path='', consistency_iter=3):
 		super(Generator, self).__init__()
-		self.FLoss = FLoss
-		self.consistensy_iter = consistensy_iter
+		self.consistency_iter = consistency_iter
 		self.model = model
-		for m in self.model.modules():
-			if isinstance(m, nn.Conv2d):
-				nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-			elif isinstance(m, nn.BatchNorm2d):
-				nn.init.constant_(m.weight, 1)
-				nn.init.constant_(m.bias, 0)
+
+		# # VGG Perceptual model
+		# self.p_model = PerceptualModel(resume_path)
+		# self.p_model.eval()
+
+		# # Mobilefacenet Perceptual model
+		# self.p_model = mobifacenet.MobileFaceNet(1)
+		# pretrained_dict = torch.load('/home/yy/FSGAN/mobilefacenet/model_mobilefacenet.pth')
+		# model_dict = self.p_model.state_dict()
+		# pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+		# model_dict.update(pretrained_dict)
+		# self.p_model.load_state_dict(model_dict)
+		# self.p_model.eval()
+
+		# New VGG arcface
+		self.p_model = vgg.VGG()
+		pretrained_dict = torch.load('./vggface.pth') # Pretrained VGG model is needed here
+		model_dict = self.p_model.state_dict()
+		pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+		model_dict.update(pretrained_dict)
+		self.p_model.load_state_dict(model_dict)
+		self.p_model.eval()
+
+	def forward(self, source_img, target_img, target_seg, hmap, m_hmaps):
+
+		inputs = torch.cat((source_img, hmap), 1)
+		outputs, _ = self.model(inputs)
+
+		pix_loss = 0.1 * torch.mul(torch.abs(outputs - target_img), target_seg).sum() / target_seg.sum()
+
+		m_img = source_img
+		for m_hmap in m_hmaps:
+			m_hmap = m_hmap.cuda()
+			m_img, _ = self.model(torch.cat((m_img, m_hmap), 1))
+		con_out, _ = self.model(torch.cat((m_img, hmap), 1))
+
+		pix_loss = 0.1 * torch.mul(torch.abs(con_out - target_img), target_seg).sum() / target_seg.sum() + pix_loss
+
+		# Perceptual model
+		fea_1, fea_2, fea_3, fea_4 = self.p_model(F.interpolate(outputs, size=(128, 128), mode='bilinear'))
+		tar_fea_1, tar_fea_2, tar_fea_3, tar_fea_4 = self.p_model(F.interpolate(target_img, size=(128, 128), mode='bilinear'))
+		con_fea_1, con_fea_2, con_fea_3, con_fea_4 = self.p_model(F.interpolate(con_out, size=(128, 128), mode='bilinear'))
+
+		per_loss = torch.mean(torch.abs(fea_1 - tar_fea_1)) + \
+		torch.mean(torch.abs(fea_2 - tar_fea_2)) + \
+		torch.mean(torch.abs(fea_3 - tar_fea_3)) + \
+		torch.mean(torch.abs(fea_4 - tar_fea_4)) + \
+		torch.mean(torch.abs(con_fea_1 - tar_fea_1)) + \
+		torch.mean(torch.abs(con_fea_2 - tar_fea_2)) + \
+		torch.mean(torch.abs(con_fea_3 - tar_fea_3)) + \
+		torch.mean(torch.abs(con_fea_4 - tar_fea_4))
+
+		gen_loss = pix_loss + per_loss
+
+		return outputs, gen_loss, con_out
+
+class Generator_enhance(nn.Module):
+	def __init__(self, model, resume_path='', consistency_iter=3):
+		super(Generator_enhance, self).__init__()
+		# self.FLoss = FLoss
+		self.consistency_iter = consistency_iter
+		self.model = model
 
 		# Perceptual model
 		self.p_model = PerceptualModel(resume_path)
@@ -381,36 +464,32 @@ class Generator(nn.Module):
 		# hmap = self.gaussian_filter(hmap)
 
 		inputs = torch.cat((source_img, hmap), 1)
-		outputs, segment = self.model(inputs)
-		out_seg = torch.mul(outputs, segment)
-		tar_seg = torch.mul(target_img, target_seg)
+		outputs, segment, outputs_lr = self.model(inputs)
 
-		pix_loss = torch.mean(torch.abs(out_seg - tar_seg))
-		# pis_loss = 0.1 * torch.mul(torch.abs(outputs - target_img), target_seg).sum() / target_seg.sum()
+		# pix_loss = torch.mean(torch.abs(out_seg - tar_seg))
+		pix_loss = 0.1 * torch.mul(torch.abs(outputs - target_img), target_seg).sum() / target_seg.sum()
 
 		# if len(m_hmaps) > 0:
 		m_img = source_img
 		for m_hmap in m_hmaps:
 			m_hmap = m_hmap.cuda()
-			m_img, _ = self.model(torch.cat((m_img, m_hmap), 1))
-		con_out, con_seg = self.model(torch.cat((m_img, hmap), 1))
-		con_out_seg = torch.mul(con_out, con_seg)
-		pix_loss = torch.mean(torch.abs(con_out_seg - tar_seg)) + pix_loss
-		# pis_loss = 0.1 * torch.mul(torch.abs(con_out - target_img), target_seg).sum() / target_seg.sum() + pix_loss
+			m_img, _, _ = self.model(torch.cat((m_img, m_hmap), 1))
+		con_out, _, _ = self.model(torch.cat((m_img, hmap), 1))
 
-		if self.FLoss:
-			BCE_loss = F.binary_cross_entropy_with_logits(segment, torch.unsqueeze(target_seg[:, 0, :, :], 1), reduction='none')
-			pt = torch.exp(-BCE_loss)
-			seg_loss = alpha * (1 - pt) ** gamma * BCE_loss
-		else:
-			seg_loss = F.binary_cross_entropy(segment, torch.unsqueeze(target_seg[:, 0, :, :], 1)) * 0.1
+		# pix_loss = torch.mean(torch.abs(con_out_seg - tar_seg)) + pix_loss
+		pix_loss = 0.1 * torch.mul(torch.abs(con_out - target_img), target_seg).sum() / target_seg.sum() + pix_loss
+
+		# if self.FLoss:
+		# 	BCE_loss = F.binary_cross_entropy_with_logits(segment, torch.unsqueeze(target_seg[:, 0, :, :], 1), reduction='none')
+		# 	pt = torch.exp(-BCE_loss)
+		# 	seg_loss = alpha * (1 - pt) ** gamma * BCE_loss
+		# else:
+		seg_loss = F.binary_cross_entropy(segment, torch.unsqueeze(target_seg[:, 0, :, :], 1)) * 0.1
 
 		# Perceptual model
-
-		with torch.no_grad():
-			fea_1, fea_2, fea_3, fea_4 = self.p_model(out_seg)
-			tar_fea_1, tar_fea_2, tar_fea_3, tar_fea_4 = self.p_model(tar_seg)
-			con_fea_1, con_fea_2, con_fea_3, con_fea_4 = self.p_model(con_out_seg)
+		fea_1, fea_2, fea_3, fea_4 = self.p_model(F.interpolate(outputs, size=(128, 128), mode='bilinear'))
+		tar_fea_1, tar_fea_2, tar_fea_3, tar_fea_4 = self.p_model(F.interpolate(target_img, size=(128, 128), mode='bilinear'))
+		con_fea_1, con_fea_2, con_fea_3, con_fea_4 = self.p_model(F.interpolate(con_out, size=(128, 128), mode='bilinear'))
 
 		per_loss = torch.mean(torch.abs(fea_1 - tar_fea_1)) + \
 		torch.mean(torch.abs(fea_2 - tar_fea_2)) + \
@@ -421,9 +500,9 @@ class Generator(nn.Module):
 		torch.mean(torch.abs(con_fea_3 - tar_fea_3)) + \
 		torch.mean(torch.abs(con_fea_4 - tar_fea_4))
 
-		gen_loss = (seg_loss + pix_loss) * 0.1 + per_loss
+		gen_loss = (seg_loss + pix_loss) + per_loss
 
-		return outputs, segment, gen_loss, con_out
+		return outputs, segment, gen_loss, con_out, outputs_lr
 
 class Discriminator(nn.Module):
 	def __init__(self, model, lossfunction):
