@@ -7,4 +7,5 @@ A Pytorch implemtentation of ICCV 2019 paper [Face Swapping Gan](https://arxiv.o
 
 ## Requirements:
 A pretrained face recognition VGG19 model
+
 A suitable dataset for face swapping and its face segmentation masks
